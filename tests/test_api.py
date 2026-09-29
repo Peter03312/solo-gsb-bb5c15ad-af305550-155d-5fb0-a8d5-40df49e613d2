@@ -20,6 +20,10 @@ def anchor(source, target):
     return {"source": source, "target": target}
 
 
+def selection(start, end):
+    return {"start": start, "end": end}
+
+
 class HealthTests(unittest.TestCase):
     def test_health(self):
         resp = client.get("/health")
@@ -858,6 +862,239 @@ class RetimeTests(unittest.TestCase):
         self.assertEqual(data["status"], "retimed")
         self.assertEqual(data["cues"], [])
         self.assertEqual(data["count"], 0)
+
+
+class SpliceTests(unittest.TestCase):
+    def test_empty_selections_returns_empty_and_zero_duration(self):
+        body = {"cues": [cue("a", 0, 5, "hi", speaker="bob")], "selections": []}
+        resp = client.post("/splice", json=body)
+        self.assertEqual(resp.status_code, 200, resp.text)
+        self.assertEqual(
+            resp.json(),
+            {"status": "spliced", "cues": [], "count": 0, "duration": 0.0},
+        )
+
+    def test_omitted_fields_default_to_empty(self):
+        resp = client.post("/splice", json={})
+        self.assertEqual(resp.status_code, 200, resp.text)
+        self.assertEqual(
+            resp.json(),
+            {"status": "spliced", "cues": [], "count": 0, "duration": 0.0},
+        )
+
+    def test_single_selection_clips_strict_intersection(self):
+        # 源 cue 0-10 与选区 5-12 严格相交部分为 5-10，映射到 0-5；10-12 为空白
+        body = {
+            "cues": [cue("a", 0, 10, "hello", speaker="alice")],
+            "selections": [selection(5, 12)],
+        }
+        resp = client.post("/splice", json=body)
+        self.assertEqual(resp.status_code, 200, resp.text)
+        data = resp.json()
+        self.assertEqual(data["status"], "spliced")
+        self.assertAlmostEqual(data["duration"], 7.0)
+        self.assertEqual(data["count"], 1)
+        out = data["cues"][0]
+        self.assertAlmostEqual(out["start"], 0.0)
+        self.assertAlmostEqual(out["end"], 5.0)
+        self.assertEqual(out["text"], "hello")
+        self.assertEqual(out["speaker"], "alice")
+        self.assertEqual(out["source_id"], "a")
+        self.assertEqual(out["selection_index"], 0)
+        self.assertEqual(out["id"], "a#0")
+
+    def test_touching_boundaries_do_not_intersect_but_count_as_duration(self):
+        # cue [0,5] 与选区 [5,8] 仅首尾相接：无片段输出，但选区时长 3s 计入
+        body = {"cues": [cue("a", 0, 5)], "selections": [selection(5, 8)]}
+        resp = client.post("/splice", json=body)
+        self.assertEqual(resp.status_code, 200, resp.text)
+        data = resp.json()
+        self.assertEqual(data["cues"], [])
+        self.assertAlmostEqual(data["duration"], 3.0)
+
+    def test_cue_spanning_selection_both_edges_is_clipped(self):
+        body = {"cues": [cue("a", 2, 8)], "selections": [selection(4, 6)]}
+        resp = client.post("/splice", json=body)
+        self.assertEqual(resp.status_code, 200, resp.text)
+        out = resp.json()["cues"][0]
+        self.assertAlmostEqual(out["start"], 0.0)
+        self.assertAlmostEqual(out["end"], 2.0)
+
+    def test_offset_is_sum_of_previous_selection_durations(self):
+        # 选区 [5,12)(7s)、[0,10)(10s)、[18,19)(1s)，总时长 18s
+        # a 片段：选区内 5-10 -> 0-5；a 全段 -> 7-17；b[15,20] 交集 18-19 -> 17-18
+        body = {
+            "cues": [
+                cue("a", 0, 10, "hello", speaker="alice"),
+                cue("b", 15, 20, "world", speaker="bob"),
+            ],
+            "selections": [selection(5, 12), selection(0, 10), selection(18, 19)],
+        }
+        resp = client.post("/splice", json=body)
+        self.assertEqual(resp.status_code, 200, resp.text)
+        data = resp.json()
+        self.assertAlmostEqual(data["duration"], 18.0)
+        got = [
+            (c["id"], c["source_id"], c["selection_index"], c["start"], c["end"])
+            for c in data["cues"]
+        ]
+        self.assertEqual(
+            got,
+            [
+                ("a#0", "a", 0, 0.0, 5.0),
+                ("a#1", "a", 1, 7.0, 17.0),
+                ("b#2", "b", 2, 17.0, 18.0),
+            ],
+        )
+
+    def test_inner_offset_relative_to_selection_start(self):
+        # 选区内 cue 起点相对选区起点的偏移保留
+        body = {"cues": [cue("a", 3, 4)], "selections": [selection(0, 10)]}
+        resp = client.post("/splice", json=body)
+        self.assertEqual(resp.status_code, 200, resp.text)
+        out = resp.json()["cues"][0]
+        self.assertAlmostEqual(out["start"], 3.0)
+        self.assertAlmostEqual(out["end"], 4.0)
+
+    def test_gap_between_cues_inside_selection_is_blank(self):
+        # 选区 0-10 内只有 [1,2) 与 [8,9) 两段字幕，中间空白计入时长
+        body = {
+            "cues": [cue("a", 1, 2), cue("b", 8, 9)],
+            "selections": [selection(0, 10)],
+        }
+        resp = client.post("/splice", json=body)
+        self.assertEqual(resp.status_code, 200, resp.text)
+        data = resp.json()
+        self.assertAlmostEqual(data["duration"], 10.0)
+        self.assertEqual(
+            [(c["source_id"], c["start"], c["end"]) for c in data["cues"]],
+            [("a", 1.0, 2.0), ("b", 8.0, 9.0)],
+        )
+
+    def test_unordered_overlapping_repeated_selections(self):
+        # 乱序、重叠、重复：选区 [2,4)、[0,2)、[2,4)
+        body = {
+            "cues": [cue("a", 0, 4, "x")],
+            "selections": [selection(2, 4), selection(0, 2), selection(2, 4)],
+        }
+        resp = client.post("/splice", json=body)
+        self.assertEqual(resp.status_code, 200, resp.text)
+        data = resp.json()
+        self.assertAlmostEqual(data["duration"], 6.0)
+        got = sorted(
+            ((c["id"], c["start"], c["end"], c["selection_index"]) for c in data["cues"]),
+            key=lambda item: item[1],
+        )
+        self.assertEqual(
+            got,
+            [("a#0", 0.0, 2.0, 0), ("a#1", 2.0, 4.0, 1), ("a#2", 4.0, 6.0, 2)],
+        )
+        # 同一原 cue 多次入选：新 id 互不相同，但 source_id 相同
+        ids = [c["id"] for c in data["cues"]]
+        self.assertEqual(len(ids), len(set(ids)))
+        self.assertTrue(all(c["source_id"] == "a" for c in data["cues"]))
+
+    def test_output_sorted_by_new_timeline(self):
+        # 源 cue 输入乱序；同一选区内多个命中片段按新时间（即源起点）排序
+        body = {
+            "cues": [cue("b", 5, 6), cue("a", 0, 3), cue("c", 3, 4)],
+            "selections": [selection(0, 10)],
+        }
+        resp = client.post("/splice", json=body)
+        self.assertEqual(resp.status_code, 200, resp.text)
+        self.assertEqual(
+            [(c["source_id"], c["selection_index"]) for c in resp.json()["cues"]],
+            [("a", 0), ("c", 0), ("b", 0)],
+        )
+
+    def test_selection_beyond_source_is_all_blank(self):
+        body = {"cues": [cue("a", 0, 1)], "selections": [selection(100, 103.5)]}
+        resp = client.post("/splice", json=body)
+        self.assertEqual(resp.status_code, 200, resp.text)
+        data = resp.json()
+        self.assertEqual(data["cues"], [])
+        self.assertAlmostEqual(data["duration"], 3.5)
+
+    def test_text_and_speaker_preserved_including_null(self):
+        body = {
+            "cues": [
+                {"id": "a", "start": 0, "end": 1, "text": "你好，世界"},
+                cue("b", 1, 2, "yo", speaker="carol"),
+            ],
+            "selections": [selection(0, 2)],
+        }
+        resp = client.post("/splice", json=body)
+        self.assertEqual(resp.status_code, 200, resp.text)
+        by_source = {c["source_id"]: c for c in resp.json()["cues"]}
+        self.assertEqual(by_source["a"]["text"], "你好，世界")
+        self.assertIsNone(by_source["a"]["speaker"])
+        self.assertEqual(by_source["b"]["speaker"], "carol")
+
+    def test_duplicate_source_ids_is_param_error_without_partial_output(self):
+        body = {
+            "cues": [cue("a", 0, 5), cue("b", 3, 4), cue("a", 6, 7)],
+            "selections": [selection(0, 10)],
+        }
+        resp = client.post("/splice", json=body)
+        self.assertEqual(resp.status_code, 422)
+        data = resp.json()
+        self.assertEqual(data["status"], "splice_error")
+        self.assertEqual(data["duplicated_ids"], ["a"])
+        self.assertNotIn("cues", data)
+
+    def test_overlapping_source_timeline_is_param_error(self):
+        body = {
+            "cues": [cue("a", 0, 5, "first"), cue("b", 3, 8, "second")],
+            "selections": [selection(0, 10)],
+        }
+        resp = client.post("/splice", json=body)
+        self.assertEqual(resp.status_code, 422)
+        data = resp.json()
+        self.assertEqual(data["status"], "splice_error")
+        self.assertEqual(data["duplicated_ids"], [])
+        self.assertEqual(len(data["overlaps"]), 1)
+        ov = data["overlaps"][0]
+        self.assertEqual(ov["cue_ids"], ["a", "b"])
+        self.assertAlmostEqual(ov["start"], 3.0)
+        self.assertAlmostEqual(ov["end"], 5.0)
+        self.assertAlmostEqual(ov["overlap"], 2.0)
+        self.assertNotIn("cues", data)
+
+    def test_touching_source_intervals_are_not_an_error(self):
+        # 源时间轴首尾相接合法，可以正常剪取
+        body = {
+            "cues": [cue("a", 0, 5), cue("b", 5, 8)],
+            "selections": [selection(0, 8)],
+        }
+        resp = client.post("/splice", json=body)
+        self.assertEqual(resp.status_code, 200, resp.text)
+        self.assertEqual([c["source_id"] for c in resp.json()["cues"]], ["a", "b"])
+
+    def test_invalid_selection_endpoints_are_422(self):
+        for bad in (selection(-1, 2), selection(2, 2), selection(3, 2.5)):
+            with self.subTest(bad=bad):
+                resp = client.post(
+                    "/splice", json={"cues": [cue("a", 0, 5)], "selections": [bad]}
+                )
+                self.assertEqual(resp.status_code, 422)
+
+    def test_invalid_source_cue_is_422(self):
+        # 源 cue 本身非法（end <= start）属于请求体校验失败
+        body = {"cues": [cue("a", 5, 2)], "selections": [selection(0, 1)]}
+        self.assertEqual(client.post("/splice", json=body).status_code, 422)
+
+    def test_zero_length_output_cues_are_never_emitted(self):
+        # cue 完全在选区之外；选区内起点恰好等于 cue 终点也不产生片段
+        body = {
+            "cues": [cue("a", 0, 2), cue("b", 20, 21)],
+            "selections": [selection(2, 20)],
+        }
+        resp = client.post("/splice", json=body)
+        self.assertEqual(resp.status_code, 200, resp.text)
+        data = resp.json()
+        self.assertEqual(data["cues"], [])
+        self.assertAlmostEqual(data["duration"], 18.0)
+        self.assertTrue(all(c["end"] > c["start"] for c in data["cues"]))
 
 
 if __name__ == "__main__":

@@ -5,6 +5,8 @@
 按 cue id 执行三方合并，检测字段级冲突、删除/修改冲突与时间轴重叠。
 `POST /resolve` 进一步支持对识别出的冲突提交人工决策，输出解决后的时间轴。
 `POST /retime` 则按 source/target 时间锚点对 cue 时间轴做分段线性校时（重映射）。
+`POST /splice` 按一组选区从现有 cue 时间轴上剪取字幕片段，跨边界裁断后依选区顺序
+（选区可乱序、重叠或重复）拼接成一条新时间轴，并保留原 id 与选区序号。
 
 技术栈：Python 3.11 · FastAPI · Pydantic v2 · Uvicorn，全部依赖与启动初始化均在容器内完成。
 
@@ -309,6 +311,106 @@ curl -X POST http://localhost:8000/retime \
 {"status":"retime_error","cue_ids":["a"]}
 ```
 
+### POST /splice
+
+按请求中的**选区列表**从现有 Cue 时间轴上剪取字幕，并**依列表顺序**拼接成一条新时间轴。
+选区可乱序、重叠或重复；每条源 cue 仅取与选区**严格相交**（交集时长 > 0，仅首尾相接不算）
+的部分，跨过选区边界的 cue 在边界处裁断。
+
+请求体：
+
+| 字段         | 类型        | 说明                                                                                |
+| ------------ | ----------- | ----------------------------------------------------------------------------------- |
+| `cues`       | Cue[]       | 源 cue 列表（可空）；结构同 `/merge` 的 Cue，要求 `end > start`，**id 不得重复**、时间轴**不得重叠** |
+| `selections` | Selection[] | 选区列表（可空），按列表顺序处理；空列表返回空 cue 列表与零时长                     |
+
+Selection 结构（闭开区间 `[start, end)`，单位秒）：
+
+```json
+{"start": 5.0, "end": 12.0}
+```
+
+剪取与拼接规则：
+
+1. 对每个选区，取每条源 cue 与该选区严格相交的部分；cue 横跨选区两端时两端都裁断；
+2. 片段在新时间轴上的时间 = **此前全部选区时长之和** + 交集起点相对**本选区起点**的偏移；
+3. **选区中的空白**（未命中任何 cue 的时间，含整条选区都在源时间轴之外）同样计入总时长；
+4. 选区可乱序、重叠或重复，严格按请求列表顺序拼接，不做去重或合并；
+5. 片段保留原 `text` / `speaker`，并通过 `source_id` 保留原 cue id、
+   `selection_index` 保留来源选区下标（**从 0 开始**）；
+6. 同一原 cue 被多个选区命中时，为每个片段生成不同的新 `id`，
+   格式为 `"{原 id}#{选区下标}"`（同一次请求内全局唯一）；
+7. 输出 cue 按新时间轴的 `start` 升序排列（平局依次按 `end`、`source_id`）；
+8. 总时长 `duration` = 各选区时长之和（含空白）；空选区列表时为空列表、`0`。
+
+#### 错误（不输出部分结果）
+
+- 选区端点为负、`end <= start`，或源 cue 本身非法（`end <= start`）→ `422`（请求体校验）；
+- **源 cue id 重复**或**源时间轴重叠**（首尾相接不算）→ `422 status=splice_error`，
+  返回 `duplicated_ids` 与/或 `overlaps`，不返回 cue 列表。
+
+调用样例（`http://localhost:8000/splice`）：
+
+```bash
+curl -X POST http://localhost:8000/splice \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "cues": [
+      {"id":"cue-01","start":0.0,"end":10.0,"text":"你好","speaker":"alice"},
+      {"id":"cue-02","start":15.0,"end":20.0,"text":"世界","speaker":null}
+    ],
+    "selections": [
+      {"start":5.0,"end":12.0},
+      {"start":0.0,"end":10.0},
+      {"start":18.0,"end":19.0}
+    ]
+  }'
+```
+
+三个选区时长分别为 7s、10s、1s（总时长 18s）：`cue-01` 在选区 0 中留下 5–10
+（映射到新轴 0–5，10–12 为空白）；在选区 1 中留下整段（偏移 7，映射到 7–17）；
+`cue-02` 在选区 2 中留下 18–19（偏移 17，映射到 17–18）：
+
+```json
+{
+  "status": "spliced",
+  "cues": [
+    {"id": "cue-01#0", "start": 0.0, "end": 5.0, "text": "你好", "speaker": "alice",
+     "source_id": "cue-01", "selection_index": 0},
+    {"id": "cue-01#1", "start": 7.0, "end": 17.0, "text": "你好", "speaker": "alice",
+     "source_id": "cue-01", "selection_index": 1},
+    {"id": "cue-02#2", "start": 17.0, "end": 18.0, "text": "世界", "speaker": null,
+     "source_id": "cue-02", "selection_index": 2}
+  ],
+  "count": 3,
+  "duration": 18.0
+}
+```
+
+源时间轴重叠时的 `422`（不返回 cues）：
+
+```bash
+curl -X POST http://localhost:8000/splice \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "cues": [
+      {"id":"a","start":0,"end":5,"text":"first"},
+      {"id":"b","start":3,"end":8,"text":"second"}
+    ],
+    "selections": [{"start":0,"end":10}]
+  }'
+```
+
+```json
+{
+  "status": "splice_error",
+  "duplicated_ids": [],
+  "overlaps": [
+    {"cue_ids": ["a", "b"], "start": 3.0, "end": 5.0, "overlap": 2.0}
+  ]
+}
+```
+
 ## 快速试用
 
 ```bash
@@ -333,12 +435,13 @@ curl -X POST http://localhost:8000/merge \
 .
 ├── app/
 │   ├── __init__.py
-│   ├── main.py       # FastAPI 路由（/health、/merge、/resolve、/retime、/）
+│   ├── main.py       # FastAPI 路由（/health、/merge、/resolve、/retime、/splice、/）
 │   ├── merge.py      # 三方合并、冲突决策应用与重叠检测纯逻辑
 │   ├── retime.py     # 时间锚点分段线性校时纯逻辑
+│   ├── splice.py     # 选区剪取与顺序拼接纯逻辑
 │   └── models.py     # Pydantic 请求/响应模型
 ├── tests/
-│   └── test_api.py   # 62 个端到端用例（unittest + TestClient）
+│   └── test_api.py   # 80 个端到端用例（unittest + TestClient）
 ├── Dockerfile
 ├── docker-compose.yml
 ├── requirements.txt

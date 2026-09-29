@@ -20,8 +20,12 @@ from .models import (
     RetimeErrorResponse,
     RetimeRequest,
     RetimeSuccessResponse,
+    SpliceParamErrorResponse,
+    SpliceRequest,
+    SpliceSuccessResponse,
 )
 from .retime import retime_cues
+from .splice import splice_cues
 
 app = FastAPI(
     title="字幕时间轴三方合并 API",
@@ -30,7 +34,9 @@ app = FastAPI(
         "按 cue id 进行三方合并、字段级冲突检测与时间轴重叠检测；"
         "POST /resolve 在同一三方合并之上应用人工冲突决策，"
         "输出解决后的时间轴；"
-        "POST /retime 按 source/target 时间锚点对 cue 时间轴做分段线性校时。"
+        "POST /retime 按 source/target 时间锚点对 cue 时间轴做分段线性校时；"
+        "POST /splice 按选区列表从现有 cue 时间轴剪取字幕，"
+        "并按选区顺序拼接成一条新时间轴。"
     ),
     version=__version__,
 )
@@ -158,3 +164,34 @@ def retime(request: RetimeRequest):
         return JSONResponse(status_code=409, content=content)
 
     return RetimeSuccessResponse(cues=result.cues, count=len(result.cues))
+
+
+@app.post(
+    "/splice",
+    tags=["splice"],
+    response_model=SpliceSuccessResponse,
+    responses={
+        422: {
+            "model": SpliceParamErrorResponse,
+            "description": (
+                "源时间轴参数错误：源 cue id 重复或源时间轴存在重叠；"
+                "不输出部分结果。请求体结构校验失败（选区端点为负、"
+                "end <= start、cue 本身非法等）同样返回 422。"
+            ),
+        }
+    },
+)
+def splice(request: SpliceRequest):
+    """按选区列表从现有 cue 时间轴剪取字幕并顺序拼接成新时间轴。"""
+    result = splice_cues(request.cues, request.selections)
+
+    if result.duplicated_ids or result.overlaps:
+        content = SpliceParamErrorResponse(
+            duplicated_ids=result.duplicated_ids,
+            overlaps=result.overlaps,
+        ).model_dump()
+        return JSONResponse(status_code=422, content=content)
+
+    return SpliceSuccessResponse(
+        cues=result.cues, count=len(result.cues), duration=result.duration
+    )

@@ -248,6 +248,88 @@ class RetimeSuccessResponse(BaseModel):
     count: int
 
 
+class Selection(BaseModel):
+    """源时间轴上的一个闭开时间选区 [start, end)（秒）。
+
+    选区可乱序、重叠或重复，按请求列表中的顺序依次剪取与拼接；
+    端点非负且 end 必须大于 start。
+    """
+
+    start: float = Field(..., ge=0, description="选区起点（秒），非负")
+    end: float = Field(..., ge=0, description="选区终点（秒），必须大于 start")
+
+    @model_validator(mode="after")
+    def _check_interval(self) -> "Selection":
+        if self.end <= self.start:
+            raise ValueError("selection 的 end 必须大于 start")
+        return self
+
+
+class SpliceRequest(BaseModel):
+    """POST /splice 的请求体：源 cue 列表与按序拼接的选区列表（均可空）。"""
+
+    cues: list[Cue] = Field(
+        default_factory=list,
+        description="源 cue 列表；id 不得重复，时间轴不得重叠",
+    )
+    selections: list[Selection] = Field(
+        default_factory=list,
+        description=(
+            "选区列表，按列表顺序拼接（可乱序、重叠或重复）；"
+            "空列表返回空 cue 列表与零时长"
+        ),
+    )
+
+
+class SplicedCue(Cue):
+    """剪取拼接到新时间轴上的一条 cue 片段。
+
+    在 Cue 的 start/end/text/speaker 之外保留溯源信息：
+    ``source_id`` 为来源原 cue 的 id，``selection_index`` 为来源选区
+    在请求列表中的下标（从 0 开始）。``id`` 为新生成的唯一 id，
+    同一原 cue 被多个选区命中时各片段 id 不同。
+    """
+
+    id: str = Field(
+        ...,
+        min_length=1,
+        description="生成的新 cue id，格式为 {原 cue id}#{选区下标}，全局唯一",
+    )
+    source_id: str = Field(..., description="该片段来源的原 cue id")
+    selection_index: int = Field(
+        ..., ge=0, description="来源选区在请求 selections 中的下标（从 0 开始）"
+    )
+
+
+class SpliceSuccessResponse(BaseModel):
+    """剪取拼接成功：cues 已按新时间轴的开始时间排序。"""
+
+    status: Literal["spliced"] = "spliced"
+    cues: list[SplicedCue]
+    count: int
+    duration: float = Field(
+        ...,
+        ge=0,
+        description=(
+            "拼接后新时间轴总时长（秒），等于各选区时长之和；"
+            "选区中的空白（未命中任何 cue 的时间）同样计入"
+        ),
+    )
+
+
+class SpliceParamErrorResponse(BaseModel):
+    """源 cue id 重复或源时间轴重叠时的 422 响应：不输出部分结果。"""
+
+    status: Literal["splice_error"] = "splice_error"
+    duplicated_ids: list[str] = Field(
+        default_factory=list,
+        description="源时间轴中重复的全部 cue id（排序去重）",
+    )
+    overlaps: list[Overlap] = Field(
+        default_factory=list, description="源时间轴上的全部重叠区间"
+    )
+
+
 class HealthResponse(BaseModel):
     """健康检查响应。"""
 
